@@ -7,7 +7,9 @@ POST /chat
 
 The backend auto-detects the actual query language from the message charset
 (Chinese vs English) regardless of the UI lang preference sent in the request.
-Conversation history is kept in memory per chatId for multi-turn context.
+
+Conversation history is persisted in SQLite. If no chatId is provided the
+request is treated as a new conversation and a fresh UUID is issued.
 """
 
 from __future__ import annotations
@@ -25,8 +27,10 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from knowledge_base import KnowledgeBase  # noqa: E402  (after load_dotenv)
-from rag_engine import RAGEngine  # noqa: E402
+from chat_logger import write_log                       # noqa: E402
+from database import init_db, load_history, save_turn  # noqa: E402
+from knowledge_base import KnowledgeBase               # noqa: E402
+from rag_engine import RAGEngine                       # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Azure OpenAI client
@@ -43,14 +47,12 @@ azure_client = AsyncAzureOpenAI(
 kb: KnowledgeBase | None = None
 rag: RAGEngine | None = None
 
-# In-memory conversation store:  chatId -> list of {role, content} messages
-sessions: dict[str, list[dict]] = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global kb, rag
     print("=== Initialising RAG chatbot (chatbotDEV3) ===")
+    await init_db()
     kb = KnowledgeBase()
     rag = RAGEngine(kb, azure_client)
     print("=== Ready ===")
@@ -76,10 +78,10 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     type: str = "cms"
     message: str
-    lang: str = "en"          # UI language preference (en / zh_hant)
+    lang: str = "en"           # UI language preference (en / zh_hant)
     env: str = "test"
     channels: dict = {}
-    chatId: str | None = None  # absent on the first turn
+    chatId: str | None = None  # absent → new conversation
 
 
 class SourceItem(BaseModel):
@@ -91,7 +93,7 @@ class SourceItem(BaseModel):
 class ChatResponse(BaseModel):
     chatId: str
     responseMsg: str
-    language: str            # detected language used for retrieval
+    language: str              # detected language used for retrieval
     sources: list[SourceItem] = []
 
 
@@ -100,12 +102,32 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/chat/chatbot/HousingAuthority/b_0ETZJljBxa/config")
+async def chatbot_config():
+    return {
+        "success": True,
+        "config": {
+            "org": "HousingAuthority",
+            "name": "b_0ETZJljBxa",
+            "streamMode": False,
+            "detectLang": True,
+            "historyLimit": 5,
+            "settings": {
+                "welcomeMsg": {},
+                "allowedDirectChat": True,
+                "allowedGroupChat": True,
+                "allowedLangs": ["en", "zh_hant"],
+            },
+        },
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "ready": rag is not None}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat/chatbot/HousingAuthority/b_0ETZJljBxa/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     if rag is None:
         raise HTTPException(status_code=503, detail="Service not ready yet.")
@@ -114,21 +136,29 @@ async def chat(request: ChatRequest):
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    # Resolve or create session
-    chat_id = request.chatId or str(uuid.uuid4())
-    history = sessions.get(chat_id, [])
+    # No chatId → new conversation; existing chatId → load its history
+    if request.chatId:
+        chat_id = request.chatId
+        history = await load_history(chat_id)
+    else:
+        chat_id = str(uuid.uuid4())
+        history = []
 
-    # RAG query
+    # RAG query with conversation history for multi-turn context
     result = await rag.query(user_message, history=history)
 
-    # Append this turn to history (store only user + assistant content, not context)
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": result["answer"]})
+    # Persist this turn to the database
+    await save_turn(chat_id, user_message, result["answer"])
 
-    # Trim history to last 10 turns (20 messages) to avoid token bloat
-    if len(history) > 20:
-        history = history[-20:]
-    sessions[chat_id] = history
+    # Write per-request log file
+    write_log(
+        chat_id=chat_id,
+        user_query=user_message,
+        expanded_query=result.get("expanded_query", user_message),
+        language=result["language"],
+        answer=result["answer"],
+        sources=result["sources"],
+    )
 
     return ChatResponse(
         chatId=chat_id,
@@ -147,6 +177,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
+        port=int(os.getenv("PORT", "8014")),
         reload=False,
     )

@@ -1,11 +1,7 @@
-FROM python:3.12-slim
+# PyTorch 2.2.2 + CUDA 12.1 + cuDNN 8 — Python 3.10 and pip included
+FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /app
-
-# Install build tools needed by some sentence-transformers dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies first (layer cache)
 COPY requirements.txt .

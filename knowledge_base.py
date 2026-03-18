@@ -16,6 +16,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 import openpyxl
+import torch
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
@@ -23,6 +24,9 @@ load_dotenv(Path(__file__).parent / ".env")
 
 EMBED_MODEL_NAME = "BAAI/bge-m3"
 CACHE_DIR = Path(__file__).parent / "cache"
+
+# Use CUDA if available, fall back to CPU gracefully
+EMBED_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def _resolve_kb_path() -> Path:
@@ -116,8 +120,8 @@ def load_all_docs() -> tuple[list[dict], list[dict]]:
 
 class KnowledgeBase:
     def __init__(self):
-        print(f"Loading embedding model: {EMBED_MODEL_NAME}")
-        self.embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        print(f"Loading embedding model: {EMBED_MODEL_NAME}  [device={EMBED_DEVICE}]")
+        self.embed_model = SentenceTransformer(EMBED_MODEL_NAME, device=EMBED_DEVICE)
 
         self.en_docs: list[dict] = []
         self.zh_docs: list[dict] = []
@@ -130,6 +134,14 @@ class KnowledgeBase:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _to_gpu(index: faiss.Index) -> faiss.Index:
+        """Move a FAISS index to GPU 0 if CUDA is available."""
+        if EMBED_DEVICE.startswith("cuda"):
+            res = faiss.StandardGpuResources()
+            return faiss.index_cpu_to_gpu(res, 0, index)
+        return index
+
     def _build_index(self, docs: list[dict]) -> faiss.Index:
         # Concatenate question + answer for richer embeddings
         texts = [f"{doc['q']} {doc['answer']}" for doc in docs]
@@ -141,9 +153,9 @@ class KnowledgeBase:
             show_progress_bar=True,
         )
         embeddings = np.array(embeddings, dtype=np.float32)
-        index = faiss.IndexFlatIP(embeddings.shape[1])
-        index.add(embeddings)
-        return index
+        cpu_index = faiss.IndexFlatIP(embeddings.shape[1])
+        cpu_index.add(embeddings)
+        return self._to_gpu(cpu_index)
 
     def _load_or_build(self) -> None:
         CACHE_DIR.mkdir(exist_ok=True)
@@ -153,9 +165,9 @@ class KnowledgeBase:
         zh_pkl = CACHE_DIR / "zh_docs.pkl"
 
         if all(p.exists() for p in [en_idx, zh_idx, en_pkl, zh_pkl]):
-            print("Loading cached FAISS indexes…")
-            self.en_index = faiss.read_index(str(en_idx))
-            self.zh_index = faiss.read_index(str(zh_idx))
+            print(f"Loading cached FAISS indexes…  [device={DEVICE}]")
+            self.en_index = self._to_gpu(faiss.read_index(str(en_idx)))
+            self.zh_index = self._to_gpu(faiss.read_index(str(zh_idx)))
             with open(en_pkl, "rb") as f:
                 self.en_docs = pickle.load(f)
             with open(zh_pkl, "rb") as f:
@@ -170,9 +182,9 @@ class KnowledgeBase:
             print("  Building ZH index…")
             self.zh_index = self._build_index(self.zh_docs)
 
-            # Persist
-            faiss.write_index(self.en_index, str(en_idx))
-            faiss.write_index(self.zh_index, str(zh_idx))
+            # Persist — GPU indexes must be moved back to CPU before writing
+            faiss.write_index(faiss.index_gpu_to_cpu(self.en_index) if EMBED_DEVICE.startswith("cuda") else self.en_index, str(en_idx))
+            faiss.write_index(faiss.index_gpu_to_cpu(self.zh_index) if EMBED_DEVICE.startswith("cuda") else self.zh_index, str(zh_idx))
             with open(en_pkl, "wb") as f:
                 pickle.dump(self.en_docs, f)
             with open(zh_pkl, "wb") as f:

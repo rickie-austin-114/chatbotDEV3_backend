@@ -2,5 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 cache/
+data/
+hf_cache/
+logs/
 .env
 *.md

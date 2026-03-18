@@ -4,13 +4,29 @@ services:
     container_name: chatbotDEV3
     ports:
       - "8014:8014"
+    runtime: nvidia
     env_file:
       - .env
     volumes:
       # Knowledge base — mount the FAQ_combined folder from the parent directory
       - ../FAQ_combined:/FAQ_combined:ro
+      # Lexicon terminology file (inside FAQ_combined/lexicon/)
+      - ../FAQ_combined/lexicon:/FAQ_combined/lexicon:ro
       # Persist FAISS cache across restarts so indexes are not rebuilt every time
       - ./cache:/app/cache
+      # Persist SQLite chat history across restarts
+      - ./data:/app/data
+      # Per-request log files
+      - ./logs:/app/logs
+      # Cache HuggingFace model weights so they are not re-downloaded on every start
+      - ./hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8014/health')"]
