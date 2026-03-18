@@ -1,0 +1,20 @@
+services:
+  chatbot:
+    build: .
+    container_name: chatbotDEV3
+    ports:
+      - "8014:8014"
+    env_file:
+      - .env
+    volumes:
+      # Knowledge base — mount the FAQ_combined folder from the parent directory
+      - ../FAQ_combined:/FAQ_combined:ro
+      # Persist FAISS cache across restarts so indexes are not rebuilt every time
+      - ./cache:/app/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8014/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
