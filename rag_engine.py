@@ -10,6 +10,7 @@ Models:
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -77,6 +78,7 @@ class RAGEngine:
         # Read retrieval limits from .env (with safe integer parsing)
         self.embed_top_k = int(os.getenv("EMBED_TOP_K", "15"))
         self.rerank_top_k = int(os.getenv("RERANK_TOP_K", "5"))
+        self.rerank_threshold = float(os.getenv("RERANK_THRESHOLD", "0.0"))
 
         print(f"Loading reranker model: {RERANK_MODEL_NAME}  [device={RERANK_DEVICE}]")
         self.reranker = CrossEncoder(RERANK_MODEL_NAME, device=RERANK_DEVICE)
@@ -146,9 +148,13 @@ class RAGEngine:
             [user_input, f"{doc['q']}\n{doc['answer']}"]
             for doc in candidates
         ]
-        scores = self.reranker.predict(pairs)
-        ranked = sorted(zip(scores, candidates), key=lambda x: float(x[0]), reverse=True)
-        top_docs = [doc for _, doc in ranked[: self.rerank_top_k]]
+        raw_scores = self.reranker.predict(pairs)
+        scores = [1 / (1 + math.exp(-float(s))) for s in raw_scores]  # sigmoid → [0, 1]
+        ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+        top_docs = [
+            doc for score, doc in ranked[: self.rerank_top_k]
+            if score >= self.rerank_threshold
+        ]
 
         # 3. Build grounded context string
         context_parts: list[str] = []
@@ -173,13 +179,65 @@ class RAGEngine:
         })
 
         # 5. LLM generation
-        response = await self.client.chat.completions.create(
-            model=self.azure_model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1200,
-        )
-        answer = response.choices[0].message.content
+        # gpt-5-mini and newer models use max_completion_tokens instead of max_tokens
+        # and do not support the temperature parameter
+        _NEW_API_MODELS = {"gpt-5-mini", "gpt-5-mini-2025-09-01", "o1", "o1-mini", "o3", "o3-mini"}
+        _use_new_api = any(self.azure_model.startswith(m) for m in _NEW_API_MODELS)
+
+        completion_kwargs: dict = {"model": self.azure_model, "messages": messages}
+        if _use_new_api:
+            completion_kwargs["max_completion_tokens"] = int(os.getenv("MAX_COMPLETION_TOKENS", "1000000"))
+        else:
+            completion_kwargs["temperature"] = 0.2
+            completion_kwargs["max_tokens"] = 1200
+
+        response = await self.client.chat.completions.create(**completion_kwargs)
+        message = response.choices[0].message
+
+        # gpt-5-mini may return None content when only reasoning tokens are produced.
+        # Fall back to the finish_reason to decide on a user-facing message.
+        answer = message.content or ""
+        if not answer.strip():
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+
+            # Collect every diagnostic field available on the response
+            diag_lines = [
+                f"[RAGEngine] WARNING: empty content returned by model '{self.azure_model}'",
+                f"  finish_reason       : {finish_reason!r}",
+                f"  prompt_tokens       : {getattr(response.usage, 'prompt_tokens', 'N/A')}",
+                f"  completion_tokens   : {getattr(response.usage, 'completion_tokens', 'N/A')}",
+                f"  total_tokens        : {getattr(response.usage, 'total_tokens', 'N/A')}",
+            ]
+
+            # Reasoning token breakdown (o-series / gpt-5-mini may populate these)
+            completion_details = getattr(response.usage, "completion_tokens_details", None)
+            if completion_details:
+                diag_lines += [
+                    f"  reasoning_tokens    : {getattr(completion_details, 'reasoning_tokens', 'N/A')}",
+                    f"  accepted_pred_tokens: {getattr(completion_details, 'accepted_prediction_tokens', 'N/A')}",
+                    f"  rejected_pred_tokens: {getattr(completion_details, 'rejected_prediction_tokens', 'N/A')}",
+                ]
+
+            # Content filter results if present
+            filter_results = getattr(choice, "content_filter_results", None)
+            if filter_results:
+                diag_lines.append(f"  content_filter      : {filter_results}")
+
+            # Log the messages sent to the model to help identify prompt issues
+            diag_lines.append(f"  messages_sent       : {len(messages)} message(s)")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "?")
+                content_preview = str(msg.get("content", ""))[:200].replace("\n", " ")
+                diag_lines.append(f"    [{i}] {role}: {content_preview}...")
+
+            print("\n".join(diag_lines))
+
+            answer = (
+                "I'm sorry, I was unable to generate a response. Please try rephrasing your question."
+                if lang == "en"
+                else "抱歉，未能生成回答，請嘗試換個方式提問。"
+            )
 
         sources = [
             {

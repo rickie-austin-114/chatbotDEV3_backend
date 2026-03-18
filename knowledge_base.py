@@ -165,7 +165,7 @@ class KnowledgeBase:
         zh_pkl = CACHE_DIR / "zh_docs.pkl"
 
         if all(p.exists() for p in [en_idx, zh_idx, en_pkl, zh_pkl]):
-            print(f"Loading cached FAISS indexes…  [device={DEVICE}]")
+            print(f"Loading cached FAISS indexes…  [device={EMBED_DEVICE}]")
             self.en_index = self._to_gpu(faiss.read_index(str(en_idx)))
             self.zh_index = self._to_gpu(faiss.read_index(str(zh_idx)))
             with open(en_pkl, "rb") as f:
