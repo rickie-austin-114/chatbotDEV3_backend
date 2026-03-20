@@ -1,0 +1,20 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# FAISS index cache (rebuilt from knowledge base)
+cache/
+
+# SQLite chat history
+data/
+
+# Per-request log files
+logs/
+
+# HuggingFace model weights
+hf_cache/
