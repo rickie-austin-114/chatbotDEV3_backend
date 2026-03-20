@@ -1,7 +1,11 @@
-# PyTorch 2.2.2 + CUDA 12.1 + cuDNN 8 — Python 3.10 and pip included
-FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
+# Lightweight Python image — models are served by TEI containers, no GPU needed here
+FROM python:3.12-slim
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies first (layer cache)
 COPY requirements.txt .

@@ -1,8 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 openpyxl==3.1.5
-sentence-transformers==3.3.1
-faiss-gpu-cu12
+faiss-cpu==1.9.0
+httpx==0.27.2
 openai==1.57.4
 numpy==1.26.4
 pydantic==2.10.3

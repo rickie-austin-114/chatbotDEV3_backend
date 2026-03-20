@@ -2,9 +2,9 @@
 RAG Engine: charset-based language detection → dense retrieval → cross-encoder
 reranking → GPT answer generation.
 
-Models:
-  Embedding : BAAI/bge-m3                (handled by KnowledgeBase)
-  Reranker  : BAAI/bge-reranker-v2-m3   (multilingual cross-encoder)
+Models are served externally via HuggingFace TEI:
+  Embedding : BAAI/bge-m3              → TEI_EMBED_URL  (handled by KnowledgeBase)
+  Reranker  : BAAI/bge-reranker-v2-m3 → TEI_RERANK_URL
   LLM       : Azure OpenAI (configurable via .env)
 """
 
@@ -14,22 +14,16 @@ import math
 import os
 from pathlib import Path
 
-import torch
+import httpx
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
-from sentence_transformers import CrossEncoder
 
-from knowledge_base import EMBED_DEVICE, KnowledgeBase
-
-RERANK_DEVICE = (
-    "cuda:1" if torch.cuda.device_count() > 1
-    else EMBED_DEVICE  # fall back to same GPU (or CPU) if only one is available
-)
+from knowledge_base import KnowledgeBase
 from lexicon import Lexicon
 
 load_dotenv(Path(__file__).parent / ".env")
 
-RERANK_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://reranker:80")
 
 _EN_SYSTEM_PROMPT_BASE = """You are a helpful Housing Authority knowledge base assistant. \
 Answer the user's question accurately and concisely based solely on the provided context.
@@ -75,19 +69,17 @@ class RAGEngine:
         self.client = azure_client
         self.azure_model = os.getenv("AZURE_MODEL", "gpt-4o-mini")
 
-        # Read retrieval limits from .env (with safe integer parsing)
-        self.embed_top_k = int(os.getenv("EMBED_TOP_K", "15"))
-        self.rerank_top_k = int(os.getenv("RERANK_TOP_K", "5"))
-        self.rerank_threshold = float(os.getenv("RERANK_THRESHOLD", "0.0"))
-
-        print(f"Loading reranker model: {RERANK_MODEL_NAME}  [device={RERANK_DEVICE}]")
-        self.reranker = CrossEncoder(RERANK_MODEL_NAME, device=RERANK_DEVICE)
+        self.embed_top_k    = int(os.getenv("EMBED_TOP_K", "15"))
+        self.rerank_top_k   = int(os.getenv("RERANK_TOP_K", "5"))
+        self.rerank_threshold = float(os.getenv("RERANK_THRESHOLD", "0.5"))
 
         self.lexicon = Lexicon()
 
         print(
             f"RAG engine ready  "
-            f"[embed_top_k={self.embed_top_k}, rerank_top_k={self.rerank_top_k}]"
+            f"[embed_top_k={self.embed_top_k}, rerank_top_k={self.rerank_top_k}, "
+            f"rerank_threshold={self.rerank_threshold}]  "
+            f"[TEI reranker: {TEI_RERANK_URL}]"
         )
 
     # ------------------------------------------------------------------
@@ -99,14 +91,11 @@ class RAGEngine:
         """
         Return 'zh_hant' if more than 10 % of the characters fall in the
         CJK Unified Ideographs block (U+4E00–U+9FFF), otherwise 'en'.
-
-        Assumes the user inputs only Chinese or English.
         """
         if not text:
             return "en"
         cjk_count = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
-        ratio = cjk_count / len(text)
-        return "zh_hant" if ratio > 0.1 else "en"
+        return "zh_hant" if cjk_count / len(text) > 0.1 else "en"
 
     # ------------------------------------------------------------------
     # RAG pipeline
@@ -120,20 +109,19 @@ class RAGEngine:
         """
         Full RAG pipeline:
           1. Detect language from input charset.
-          2. Dense retrieval with bge-m3 (EMBED_TOP_K candidates).
-          3. Cross-encoder reranking with bge-reranker-v2-m3.
-          4. Keep RERANK_TOP_K docs as grounded context.
-          5. Call Azure OpenAI with conversation history preserved.
-
-        Returns dict with keys: answer, sources, language.
+          2. Expand query with lexicon definitions (Option 3).
+          3. Dense retrieval via TEI embed + FAISS (EMBED_TOP_K candidates).
+          4. Cross-encoder reranking via TEI rerank; sigmoid-normalise scores.
+          5. Keep docs above RERANK_THRESHOLD, up to RERANK_TOP_K.
+          6. Call Azure OpenAI with grounded context + conversation history.
         """
         lang = self.detect_language(user_input)
 
         # Option 3 — expand query with lexicon definitions before retrieval
         expanded_query = self.lexicon.expand_query(user_input, lang)
 
-        # 1. Dense retrieval (use expanded query for better embedding match)
-        candidates = self.kb.search(expanded_query, lang, top_k=self.embed_top_k)
+        # 1. Dense retrieval
+        candidates = await self.kb.search(expanded_query, lang, top_k=self.embed_top_k)
         if not candidates:
             fallback = (
                 "I'm sorry, I couldn't find relevant information for your query. "
@@ -143,36 +131,56 @@ class RAGEngine:
             )
             return {"answer": fallback, "sources": [], "language": lang, "expanded_query": expanded_query}
 
-        # 2. Cross-encoder reranking
-        pairs = [
-            [user_input, f"{doc['q']}\n{doc['answer']}"]
-            for doc in candidates
-        ]
-        raw_scores = self.reranker.predict(pairs)
-        scores = [1 / (1 + math.exp(-float(s))) for s in raw_scores]  # sigmoid → [0, 1]
-        ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+        # 2. Cross-encoder reranking via TEI (batched to avoid 413)
+        texts = [f"{doc['q']}\n{doc['answer']}" for doc in candidates]
+        rerank_batch_size = int(os.getenv("TEI_RERANK_BATCH_SIZE", "32"))
+        raw_results: list[dict] = []
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for i in range(0, len(texts), rerank_batch_size):
+                batch_texts = texts[i : i + rerank_batch_size]
+                resp = await client.post(
+                    f"{TEI_RERANK_URL}/rerank",
+                    json={"query": user_input, "texts": batch_texts, "raw_scores": True, "return_text": False},
+                )
+                resp.raise_for_status()
+                for r in resp.json():
+                    # Offset the index back to the global candidates list
+                    raw_results.append({"index": r["index"] + i, "score": r["score"]})
+
+        # Sort all batches together by score descending, then apply sigmoid threshold
+        raw_results.sort(key=lambda r: r["score"], reverse=True)
         top_docs = [
-            doc for score, doc in ranked[: self.rerank_top_k]
-            if score >= self.rerank_threshold
+            candidates[r["index"]]
+            for r in raw_results[: self.rerank_top_k]
+            if 1 / (1 + math.exp(-float(r["score"]))) >= self.rerank_threshold
         ]
+
+        if not top_docs:
+            fallback = (
+                "I'm sorry, I couldn't find sufficiently relevant information for your query. "
+                "Please try rephrasing or contact our service centre."
+                if lang == "en"
+                else "抱歉，未找到足夠相關的資訊。請換個方式提問，或聯絡我們的服務中心。"
+            )
+            return {"answer": fallback, "sources": [], "language": lang, "expanded_query": expanded_query}
 
         # 3. Build grounded context string
-        context_parts: list[str] = []
-        for i, doc in enumerate(top_docs, 1):
-            part = f"[Source {i}]\nQ: {doc['q']}\nA: {doc['answer']}"
-            context_parts.append(part)
+        context_parts = [
+            f"[Source {i}]\nQ: {doc['q']}\nA: {doc['answer']}"
+            for i, doc in enumerate(top_docs, 1)
+        ]
         context = "\n\n".join(context_parts)
 
-        # 4. Build messages list (system + optional history + current turn)
-        # Option 2 — append glossary to system prompt so LLM understands domain terms
+        # 4. Build messages (system + optional history + current turn)
+        # Option 2 — append glossary to system prompt
         base_prompt = _EN_SYSTEM_PROMPT_BASE if lang == "en" else _ZH_SYSTEM_PROMPT_BASE
-        glossary = self.lexicon.glossary_text(lang)
+        glossary    = self.lexicon.glossary_text(lang)
         system_prompt = f"{base_prompt}\n\n{glossary}" if glossary else base_prompt
-        messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
         if history:
             messages.extend(history)
-
         messages.append({
             "role": "user",
             "content": f"Context:\n{context}\n\nUser Question: {user_input}",
@@ -180,7 +188,6 @@ class RAGEngine:
 
         # 5. LLM generation
         # gpt-5-mini and newer models use max_completion_tokens instead of max_tokens
-        # and do not support the temperature parameter
         _NEW_API_MODELS = {"gpt-5-mini", "gpt-5-mini-2025-09-01", "o1", "o1-mini", "o3", "o3-mini"}
         _use_new_api = any(self.azure_model.startswith(m) for m in _NEW_API_MODELS)
 
@@ -192,16 +199,13 @@ class RAGEngine:
             completion_kwargs["max_tokens"] = 1200
 
         response = await self.client.chat.completions.create(**completion_kwargs)
-        message = response.choices[0].message
+        message  = response.choices[0].message
 
-        # gpt-5-mini may return None content when only reasoning tokens are produced.
-        # Fall back to the finish_reason to decide on a user-facing message.
         answer = message.content or ""
         if not answer.strip():
-            choice = response.choices[0]
+            choice        = response.choices[0]
             finish_reason = choice.finish_reason
 
-            # Collect every diagnostic field available on the response
             diag_lines = [
                 f"[RAGEngine] WARNING: empty content returned by model '{self.azure_model}'",
                 f"  finish_reason       : {finish_reason!r}",
@@ -209,8 +213,6 @@ class RAGEngine:
                 f"  completion_tokens   : {getattr(response.usage, 'completion_tokens', 'N/A')}",
                 f"  total_tokens        : {getattr(response.usage, 'total_tokens', 'N/A')}",
             ]
-
-            # Reasoning token breakdown (o-series / gpt-5-mini may populate these)
             completion_details = getattr(response.usage, "completion_tokens_details", None)
             if completion_details:
                 diag_lines += [
@@ -218,19 +220,13 @@ class RAGEngine:
                     f"  accepted_pred_tokens: {getattr(completion_details, 'accepted_prediction_tokens', 'N/A')}",
                     f"  rejected_pred_tokens: {getattr(completion_details, 'rejected_prediction_tokens', 'N/A')}",
                 ]
-
-            # Content filter results if present
             filter_results = getattr(choice, "content_filter_results", None)
             if filter_results:
                 diag_lines.append(f"  content_filter      : {filter_results}")
-
-            # Log the messages sent to the model to help identify prompt issues
             diag_lines.append(f"  messages_sent       : {len(messages)} message(s)")
             for i, msg in enumerate(messages):
-                role = msg.get("role", "?")
                 content_preview = str(msg.get("content", ""))[:200].replace("\n", " ")
-                diag_lines.append(f"    [{i}] {role}: {content_preview}...")
-
+                diag_lines.append(f"    [{i}] {msg.get('role', '?')}: {content_preview}...")
             print("\n".join(diag_lines))
 
             answer = (
@@ -240,11 +236,7 @@ class RAGEngine:
             )
 
         sources = [
-            {
-                "q": doc["q"],
-                "answer": doc["answer"],
-                "source": doc.get("source", ""),
-            }
+            {"q": doc["q"], "answer": doc["answer"], "source": doc.get("source", "")}
             for doc in top_docs[:3]
         ]
 
